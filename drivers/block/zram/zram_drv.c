@@ -1415,7 +1415,7 @@ static int zram_read_from_zspool(struct zram *zram, struct page *page,
 			    zram_entry_handle(zram, entry), ZS_MM_RO);
 	if (size == PAGE_SIZE) {
 		dst = kmap_local_page(page);
-		memcpy(dst, src, PAGE_SIZE);
+		copy_page(dst, src);
 		kunmap_local(dst);
 		ret = 0;
 	} else {
