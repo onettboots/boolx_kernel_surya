@@ -1487,9 +1487,21 @@ void *zs_map_object(struct zs_pool *pool, unsigned long handle,
 	area->vm_mm = mm;
 	if (off + class->size <= PAGE_SIZE) {
 		/* this object is contained entirely within a page */
-		area->vm_addr = kmap_atomic(page);
-		ret = area->vm_addr + off;
-		goto out;
+		addr = kmap_atomic(page);
+		addr += off;
+	} else {
+		size_t sizes[2];
+
+		/* this object spans two pages */
+		sizes[0] = PAGE_SIZE - off;
+		sizes[1] = class->size - sizes[0];
+		addr = local_copy;
+
+		memcpy_from_page(addr, page,
+				 off, sizes[0]);
+		memcpy_from_page(addr + sizes[0],
+				 get_next_page(page),
+				 0, sizes[1]);
 	}
 
 	/* this object spans two pages */
@@ -1522,24 +1534,66 @@ void zs_unmap_object(struct zs_pool *pool, unsigned long handle)
 	class = zspage_class(pool, zspage);
 	off = (class->size * obj_idx) & ~PAGE_MASK;
 
-	area = this_cpu_ptr(&zs_map_area);
-	if (off + class->size <= PAGE_SIZE)
-		kunmap_atomic(area->vm_addr);
-	else {
-		struct page *pages[2];
-
-		pages[0] = page;
-		pages[1] = get_next_page(page);
-		BUG_ON(!pages[1]);
-
-		__zs_unmap_object(area, pages, off, class->size);
+	if (off + class->size <= PAGE_SIZE) {
+		if (!ZsHugePage(zspage))
+			off += ZS_HANDLE_SIZE;
+		handle_mem -= off;
+		kunmap_atomic(handle_mem);
 	}
 	put_cpu_var(zs_map_area);
 
 	migrate_read_unlock(zspage);
 	unpin_tag(handle);
 }
-EXPORT_SYMBOL_GPL(zs_unmap_object);
+EXPORT_SYMBOL_GPL(zs_obj_read_end);
+
+void zs_obj_write(struct zs_pool *pool, unsigned long handle,
+		  void *handle_mem, size_t mem_len)
+{
+	struct zspage *zspage;
+	struct page *page;
+	unsigned long obj, off;
+	unsigned int obj_idx;
+	struct size_class *class;
+
+	/* Guarantee we can get zspage from handle safely */
+	read_lock(&pool->lock);
+	obj = handle_to_obj(handle);
+	obj_to_location(obj, &page, &obj_idx);
+	zspage = get_zspage(page);
+
+	/* Make sure migration doesn't move any pages in this zspage */
+	zspage_read_lock(zspage);
+	read_unlock(&pool->lock);
+
+	class = zspage_class(pool, zspage);
+	off = offset_in_page(class->size * obj_idx);
+
+	if (off + class->size <= PAGE_SIZE) {
+		/* this object is contained entirely within a page */
+		void *dst = kmap_atomic(page);
+
+		if (!ZsHugePage(zspage))
+			off += ZS_HANDLE_SIZE;
+		memcpy(dst + off, handle_mem, mem_len);
+		kunmap_atomic(dst);
+	} else {
+		/* this object spans two pages */
+		size_t sizes[2];
+
+		off += ZS_HANDLE_SIZE;
+		sizes[0] = PAGE_SIZE - off;
+		sizes[1] = mem_len - sizes[0];
+
+		memcpy_to_page(page, off,
+			       handle_mem, sizes[0]);
+		memcpy_to_page(get_next_page(page), 0,
+			       handle_mem + sizes[0], sizes[1]);
+	}
+
+	zspage_read_unlock(zspage);
+}
+EXPORT_SYMBOL_GPL(zs_obj_write);
 
 /**
  * zs_huge_class_size() - Returns the size (in bytes) of the first huge
@@ -1686,12 +1740,15 @@ static void obj_free(int class_size, unsigned long obj)
 	zspage = get_zspage(f_page);
 
 	vaddr = kmap_atomic(f_page);
+	link = (struct link_free *)(vaddr + f_offset);
 
 	/* Insert this object in containing zspage's freelist */
 	link = (struct link_free *)(vaddr + f_offset);
 	link->next = get_freeobj(zspage) << OBJ_TAG_BITS;
 	kunmap_atomic(vaddr);
 	set_freeobj(zspage, f_objidx);
+
+	kunmap_atomic(vaddr);
 	mod_zspage_inuse(zspage, -1);
 }
 
@@ -1774,6 +1831,13 @@ static void zs_object_copy(struct size_class *class, unsigned long dst,
 		d_off += size;
 		d_size -= size;
 
+		/*
+		 * Calling kunmap_atomic(d_addr) is necessary. kunmap_atomic()
+		 * calls must occurs in reverse order of calls to kmap_atomic().
+		 * So, to call kunmap_atomic(s_addr) we should first call
+		 * kunmap_atomic(d_addr). For more details see
+		 * Documentation/mm/highmem.rst.
+		 */
 		if (s_off >= PAGE_SIZE) {
 			kunmap_atomic(d_addr);
 			kunmap_atomic(s_addr);
@@ -2087,15 +2151,8 @@ int zs_page_migrate(struct address_space *mapping, struct page *newpage,
 		offset = PAGE_SIZE;
 	}
 
-	pos = offset;
+	offset = get_first_obj_offset(page);
 	s_addr = kmap_atomic(page);
-	while (pos < PAGE_SIZE) {
-		if (obj_allocated(page, s_addr + pos, &handle)) {
-			if (!trypin_tag(handle))
-				goto unpin_objects;
-		}
-		pos += class->size;
-	}
 
 	/*
 	 * Here, any user cannot access all objects in the zspage so let's move.
@@ -2117,6 +2174,7 @@ int zs_page_migrate(struct address_space *mapping, struct page *newpage,
 			record_obj(handle, new_obj);
 		}
 	}
+	kunmap_atomic(s_addr);
 
 	replace_sub_page(class, zspage, newpage, page);
 	get_page(newpage);
